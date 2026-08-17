@@ -839,8 +839,16 @@ impl DeltaLayerInner {
             // production code path
             expected_summary.index_start_blk = actual_summary.index_start_blk;
             expected_summary.index_root_blk = actual_summary.index_root_blk;
-            // mask out the timeline_id, but still require the layers to be from the same tenant
+            // mask out the timeline_id — layers are adopted across timelines
+            // by detach_ancestor
             expected_summary.timeline_id = actual_summary.timeline_id;
+            // mask out the tenant_id too: a tenant materialized by copying
+            // another tenant's layer objects (point-in-time resurrection from
+            // bucket versions) carries the source tenant in every summary.
+            // The index_part that routed us to this layer is the per-tenant
+            // authority; the summary check still guards magic, format and
+            // key range.
+            expected_summary.tenant_id = actual_summary.tenant_id;
 
             if actual_summary != expected_summary {
                 bail!(
