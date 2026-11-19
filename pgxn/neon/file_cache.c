@@ -640,42 +640,117 @@ lfc_init(void)
  * Dump a list of pages that are currently in the LFC
  *
  * This is used to get a snapshot that can be used to prewarm the LFC later.
+ * It is a best-effort warmup hint, not a consistent snapshot of the cache.
+ * Copy bounded batches under lfc_lock, and do allocation and page-by-page
+ * validation outside it so that ordinary cache operations can keep running.
  */
+#define LFC_STATE_BATCH_SIZE 128
+#define LFC_STATE_RESUME_KEYS 8
+
+typedef struct LfcStateEntry
+{
+	BufferTag	key;
+	uint32		state[MAX_BLOCKS_PER_CHUNK / 16];
+} LfcStateEntry;
+
 FileCacheState*
 lfc_get_state(size_t max_entries)
 {
-	FileCacheState* fcs = NULL;
+	FileCacheState* fcs;
+	LfcStateEntry batch[LFC_STATE_BATCH_SIZE];
+	BufferTag	resume_keys[LFC_STATE_RESUME_KEYS];
+	uint64		generation;
+	size_t		capacity;
+	size_t		i = 0;
+	size_t		n_pages = 0;
+	int			n_resume = 0;
+	uint8	   *bitmap;
 
 	if (lfc_maybe_disabled() || max_entries == 0)	/* fast exit if file cache is disabled */
 		return NULL;
 
 	LWLockAcquire(lfc_lock, LW_SHARED);
+	capacity = LFC_ENABLED() ? Min(max_entries, lfc_ctl->used - lfc_ctl->pinned) : 0;
+	generation = lfc_ctl->generation;
+	LWLockRelease(lfc_lock);
 
-	if (LFC_ENABLED())
+	/* In particular, do not allocate/zero a large manifest while holding the lock. */
+	fcs = (FileCacheState*)palloc0(FILE_CACHE_STATE_SIZE_FOR_CHUNKS(capacity));
+	fcs->magic = FILE_CACHE_STATE_MAGIC;
+	fcs->chunk_size_log = lfc_chunk_size_log;
+	fcs->n_chunks = capacity;
+	bitmap = FILE_CACHE_STATE_BITMAP(fcs);
+
+	while (i < capacity)
 	{
-		dlist_iter iter;
-		size_t i = 0;
-		uint8* bitmap;
-		size_t n_pages = 0;
-		size_t n_entries = Min(max_entries, lfc_ctl->used - lfc_ctl->pinned);
-		size_t state_size = FILE_CACHE_STATE_SIZE_FOR_CHUNKS(n_entries);
-		fcs = (FileCacheState*)palloc0(state_size);
-		SET_VARSIZE(fcs, state_size);
-		fcs->magic = FILE_CACHE_STATE_MAGIC;
-		fcs->chunk_size_log = lfc_chunk_size_log;
-		fcs->n_chunks = n_entries;
-		bitmap = FILE_CACHE_STATE_BITMAP(fcs);
+		dlist_node *node = NULL;
+		int			n_batch = 0;
 
-		dlist_reverse_foreach(iter, &lfc_ctl->lru)
+		CHECK_FOR_INTERRUPTS();
+		LWLockAcquire(lfc_lock, LW_SHARED);
+		if (!LFC_ENABLED() || lfc_ctl->generation != generation)
 		{
-			FileCacheEntry *entry = dlist_container(FileCacheEntry, list_node, iter.cur);
-			fcs->chunks[i] = entry->key;
+			LWLockRelease(lfc_lock);
+			break;
+		}
+
+		if (i == 0)
+			node = lfc_ctl->lru.head.prev;
+		else
+		{
+			/*
+			 * Never retain an entry/list pointer across unlock. An entry may
+			 * have been evicted, reused or removed from the LRU while pinned.
+			 * A few lookahead keys let us skip such entries without losing
+			 * the rest of an otherwise useful manifest.
+			 */
+			for (int j = 0; j < n_resume; j++)
+			{
+				FileCacheEntry *entry = hash_search(lfc_hash, &resume_keys[j], HASH_FIND, NULL);
+
+				if (entry != NULL && entry->access_count == 0)
+				{
+					node = &entry->list_node;
+					break;
+				}
+			}
+		}
+		if (node == NULL)
+		{
+			LWLockRelease(lfc_lock);
+			break;
+		}
+
+		while (node != &lfc_ctl->lru.head && n_batch < LFC_STATE_BATCH_SIZE &&
+			   i + n_batch < capacity)
+		{
+			FileCacheEntry *entry = dlist_container(FileCacheEntry, list_node, node);
+
+			batch[n_batch].key = entry->key;
+			memcpy(batch[n_batch].state, entry->state, (lfc_blocks_per_chunk * 2 + 31) / 32 * 4);
+			n_batch++;
+			node = node->prev;
+		}
+		n_resume = 0;
+		while (node != &lfc_ctl->lru.head && n_resume < LFC_STATE_RESUME_KEYS)
+		{
+			FileCacheEntry *entry = dlist_container(FileCacheEntry, list_node, node);
+
+			resume_keys[n_resume++] = entry->key;
+			node = node->prev;
+		}
+		LWLockRelease(lfc_lock);
+
+		CHECK_FOR_INTERRUPTS();
+		for (int k = 0; k < n_batch; k++, i++)
+		{
+			fcs->chunks[i] = batch[k].key;
 			for (int j = 0; j < lfc_blocks_per_chunk; j++)
 			{
-				if (GET_STATE(entry, j) != UNAVAILABLE)
+				if (GET_STATE(&batch[k], j) != UNAVAILABLE)
 				{
 					/* Validate the buffer tag before including it */
-					BufferTag test_tag = entry->key;
+					BufferTag test_tag = batch[k].key;
 					test_tag.blockNum += j;
 
 					if (BufferTagIsValid(&test_tag))
@@ -689,16 +764,22 @@ lfc_get_state(size_t max_entries)
 					}
 				}
 			}
-			if (++i == n_entries)
-				break;
 		}
-		Assert(i == n_entries);
-		fcs->n_pages = n_pages;
-		Assert(pg_popcount((char*)bitmap, ((n_entries << lfc_chunk_size_log) + 7)/8) == n_pages);
-		elog(LOG, "LFC: save state of %d chunks %d pages (validated)", (int)n_entries, (int)n_pages);
+		if (n_resume == 0)
+			break;
 	}
 
-	LWLockRelease(lfc_lock);
+	/*
+	 * Churn may shorten the scan or move entries behind our cursor, so missing
+	 * or repeated hints are allowed. The initial capacity bounds total work.
+	 * Compact the bitmap to match the actual count, preserving the wire format.
+	 */
+	fcs->n_chunks = i;
+	fcs->n_pages = n_pages;
+	memmove(FILE_CACHE_STATE_BITMAP(fcs), bitmap, ((i << lfc_chunk_size_log) + 7) / 8);
+	SET_VARSIZE(fcs, FILE_CACHE_STATE_SIZE_FOR_CHUNKS(i));
+	Assert(pg_popcount((char*)FILE_CACHE_STATE_BITMAP(fcs), ((i << lfc_chunk_size_log) + 7)/8) == n_pages);
+	elog(LOG, "LFC: save state of %d chunks %d pages (validated)", (int)i, (int)n_pages);
 
 	return fcs;
 }
