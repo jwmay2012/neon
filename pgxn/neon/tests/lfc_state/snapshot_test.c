@@ -21,6 +21,7 @@ void _PG_init(void);
 PG_FUNCTION_INFO_V1(snapshot_seed);
 PG_FUNCTION_INFO_V1(snapshot_capture);
 PG_FUNCTION_INFO_V1(snapshot_probe);
+PG_FUNCTION_INFO_V1(snapshot_shuffle);
 
 #define MAX_BLOCKS_PER_CHUNK 128
 static int lfc_blocks_per_chunk = 128;
@@ -44,9 +45,11 @@ static int fixture_capacity = 65536;
 static shmem_request_hook_type previous_request;
 static shmem_startup_hook_type previous_startup;
 static uint64 acquisitions, releases, allocations_locked, max_hold_us;
+static uint64 hold_samples[65536];
 static TimestampTz acquired_at;
 static const char *action;
 static pg_prng_state random_state;
+static int fixture_batch_size(void);
 
 static bool lfc_maybe_disabled(void) { return !lfc_ctl || lfc_ctl->limit == 0; }
 #define LFC_ENABLED() (lfc_ctl->limit != 0)
@@ -139,6 +142,31 @@ snapshot_seed(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+Datum
+snapshot_shuffle(PG_FUNCTION_ARGS)
+{
+	FileCacheEntry **entries = palloc(sizeof(FileCacheEntry *) * lfc_ctl->used);
+	dlist_iter iter;
+	uint32 count = 0;
+
+	pg_prng_seed(&random_state, 42);
+	LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
+	dlist_foreach(iter, &lfc_ctl->lru)
+		entries[count++] = dlist_container(FileCacheEntry, list_node, iter.cur);
+	for (uint32 i = count; i > 1; i--)
+	{
+		uint32 j = pg_prng_uint64(&random_state) % i;
+		FileCacheEntry *entry = entries[i - 1];
+		entries[i - 1] = entries[j];
+		entries[j] = entry;
+	}
+	dlist_init(&lfc_ctl->lru);
+	for (uint32 i = 0; i < count; i++) dlist_push_tail(&lfc_ctl->lru, &entries[i]->list_node);
+	LWLockRelease(lfc_lock);
+	pfree(entries);
+	PG_RETURN_VOID();
+}
+
 /* Deliberate interleavings run only after the production function unlocks. */
 static void
 fixture_interleave(void)
@@ -164,7 +192,7 @@ fixture_interleave(void)
 	if (strcmp(action, "disable") == 0) lfc_ctl->limit = 0;
 	for (int i = 0; i < (churn ? 8 : count); i++)
 	{
-		uint32 index = churn ? pg_prng_uint64(&random_state) % lfc_ctl->used : lfc_ctl->used - 129 - i;
+		uint32 index = churn ? pg_prng_uint64(&random_state) % lfc_ctl->used : lfc_ctl->used - fixture_batch_size() - 1 - i;
 		BufferTag key = fixture_key(index);
 		FileCacheEntry *entry = hash_search(lfc_hash, &key, HASH_FIND, NULL);
 
@@ -215,8 +243,10 @@ capture_acquire(LWLock *lock, LWLockMode mode)
 static void
 capture_release(LWLock *lock)
 {
-	max_hold_us = Max(max_hold_us, GetCurrentTimestamp() - acquired_at);
+	uint64 elapsed = GetCurrentTimestamp() - acquired_at;
+	max_hold_us = Max(max_hold_us, elapsed);
 	LWLockRelease(lock);
+	if (releases < lengthof(hold_samples)) hold_samples[releases] = elapsed;
 	releases++;
 	fixture_interleave();
 }
@@ -237,6 +267,23 @@ capture_allocate(Size size)
 #undef LWLockRelease
 #undef LWLockAcquire
 
+static int
+fixture_batch_size(void)
+{
+#ifdef LFC_STATE_BATCH_SIZE
+	return LFC_STATE_BATCH_SIZE;
+#else
+	return 128;
+#endif
+}
+
+static int
+compare_holds(const void *a, const void *b)
+{
+	uint64 left = *(const uint64 *)a, right = *(const uint64 *)b;
+	return (left > right) - (left < right);
+}
+
 Datum
 snapshot_capture(PG_FUNCTION_ARGS)
 {
@@ -248,6 +295,7 @@ snapshot_capture(PG_FUNCTION_ARGS)
 	bool ordered = true;
 	bool *seen;
 	Size bitmap_bytes;
+	size_t samples;
 
 	action = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	lfc_chunk_size_log = lfc_ctl->chunk_log;
@@ -257,6 +305,8 @@ snapshot_capture(PG_FUNCTION_ARGS)
 	started = GetCurrentTimestamp();
 	state = lfc_get_state(limit);
 	elapsed = GetCurrentTimestamp() - started;
+	samples = Min(releases, lengthof(hold_samples));
+	qsort(hold_samples, samples, sizeof(uint64), compare_holds);
 	if (state == NULL) PG_RETURN_TEXT_P(cstring_to_text("null"));
 	bitmap_bytes = ((size_t)state->n_chunks * lfc_blocks_per_chunk + 7) / 8;
 	if (VARSIZE(state) != FILE_CACHE_STATE_SIZE(state) ||
@@ -276,10 +326,13 @@ snapshot_capture(PG_FUNCTION_ARGS)
 				elog(ERROR, "snapshot page bits differ from fixture");
 	}
 	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
-		"{\"chunks\":%u,\"pages\":%u,\"unique\":%u,\"bytes\":%u,\"ordered\":%s,"
-		"\"locks\":%llu,\"allocations_locked\":%llu,\"max_hold_us\":%llu,\"elapsed_us\":%llu}",
+		"{\"chunks\":%u,\"pages\":%u,\"unique\":%u,\"bytes\":%u,\"ordered\":%s,\"batch_size\":%d,"
+		"\"locks\":%llu,\"allocations_locked\":%llu,\"p50_hold_us\":%llu,\"p95_hold_us\":%llu,\"max_hold_us\":%llu,\"elapsed_us\":%llu}",
 		state->n_chunks, state->n_pages, unique, VARSIZE(state), ordered ? "true" : "false",
+		fixture_batch_size(),
 		(unsigned long long) acquisitions, (unsigned long long) allocations_locked,
+		(unsigned long long) (samples ? hold_samples[samples / 2] : 0),
+		(unsigned long long) (samples ? hold_samples[samples * 95 / 100] : 0),
 		(unsigned long long) max_hold_us, (unsigned long long) elapsed)));
 }
 

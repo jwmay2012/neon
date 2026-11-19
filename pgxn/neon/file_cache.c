@@ -644,7 +644,7 @@ lfc_init(void)
  * Copy bounded batches under lfc_lock, and do allocation and page-by-page
  * validation outside it so that ordinary cache operations can keep running.
  */
-#define LFC_STATE_BATCH_SIZE 128
+#define LFC_STATE_BATCH_SIZE 8192
 #define LFC_STATE_RESUME_KEYS 8
 
 typedef struct LfcStateEntry
@@ -657,7 +657,7 @@ FileCacheState*
 lfc_get_state(size_t max_entries)
 {
 	FileCacheState* fcs;
-	LfcStateEntry batch[LFC_STATE_BATCH_SIZE];
+	LfcStateEntry *batch;
 	BufferTag	resume_keys[LFC_STATE_RESUME_KEYS];
 	uint64		generation;
 	size_t		capacity;
@@ -680,6 +680,7 @@ lfc_get_state(size_t max_entries)
 	fcs->chunk_size_log = lfc_chunk_size_log;
 	fcs->n_chunks = capacity;
 	bitmap = FILE_CACHE_STATE_BITMAP(fcs);
+	batch = palloc0(sizeof(LfcStateEntry) * Min(capacity, LFC_STATE_BATCH_SIZE));
 
 	while (i < capacity)
 	{
@@ -774,6 +775,7 @@ lfc_get_state(size_t max_entries)
 	 * or repeated hints are allowed. The initial capacity bounds total work.
 	 * Compact the bitmap to match the actual count, preserving the wire format.
 	 */
+	pfree(batch);
 	fcs->n_chunks = i;
 	fcs->n_pages = n_pages;
 	memmove(FILE_CACHE_STATE_BITMAP(fcs), bitmap, ((i << lfc_chunk_size_log) + 7) / 8);

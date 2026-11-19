@@ -4,10 +4,11 @@ The manifest is a best-effort list of pages to fetch during prewarming. Capture
 does not need a point-in-time view, but must keep memory access and serialization
 valid while allowing ordinary cache operations to run.
 
-`lfc_get_state()` copies at most 128 entries under each shared lock hold. It
+`lfc_get_state()` copies at most 8,192 entries under each shared lock hold. It
 resumes by looking up copied keys, never by following a pointer retained across
 unlock. A short lookahead tolerates pinned or evicted resume entries. Allocation,
 per-page validation, bitmap construction and final compaction run unlocked.
+The roughly 416KiB batch buffer is allocated on the heap outside the lock.
 
 Concurrent LRU changes may omit or repeat hints. If every resume key disappears,
 or the cache is disabled/recreated, capture returns the valid prefix already
@@ -47,11 +48,13 @@ under arbitrary concurrent activity.
 
 The benchmark seeds 6,291,456 metadata entries and runs a competing backend
 acquiring the same lock exclusively. It reports capture time, largest lock hold
-and the competing backend's largest wait. It does not allocate six TiB of page
+with median/p95 hold times, and the competing backend's largest wait. Set
+`LFC_SNAPSHOT_SHUFFLE=true` to randomize the LRU instead of scanning entries in
+allocation order. It does not allocate six TiB of page
 contents. Allow roughly a GiB of shared-memory/data allocation.
 
 ```zsh
-zsh pgxn/neon/tests/lfc_state/run.zsh /path/to/pg_config 6291456 benchmark
+LFC_SNAPSHOT_SHUFFLE=true zsh pgxn/neon/tests/lfc_state/run.zsh /path/to/pg_config 6291456 benchmark
 ```
 
 Set `LFC_SNAPSHOT_SOURCE` to an unchanged `file_cache.c` to measure the same
@@ -61,15 +64,20 @@ Benchmark timings depend on the machine; correctness tests do not assert a
 wall-clock performance threshold.
 
 An isolated PostgreSQL 16 / optimized-build comparison with 6,291,456 entries
-produced the following example. Both captures returned all entries; the separate
-deterministic churn case retained 63,599 of 65,536 unique hints (97.0%).
+in randomized LRU order produced the following example. Both captures returned
+all entries; deterministic churn retained 65,499 of 65,536 unique hints (99.9%).
 
 | Measurement | Previous capture | Batched capture |
 |---|---:|---:|
-| Total capture time | 1,204 ms | 1,323 ms |
-| Largest snapshot lock hold | 1,204 ms | 0.398 ms |
-| Competing backend's largest lock wait | 1,204 ms | 0.292 ms |
+| Total capture time | 1,402 ms | 2,106 ms |
+| Median snapshot lock hold | 1,402 ms | 1.134 ms |
+| p95 snapshot lock hold | 1,402 ms | 1.293 ms |
+| Largest snapshot lock hold | 1,402 ms | 8.058 ms |
+| Competing backend's largest lock wait | 1,402 ms | 8.071 ms |
 
 The improvement is reader progress during capture, not a reduction in total
-snapshot CPU work. Linux and macOS regression runs pass; the unchanged source
-fails the allocation-outside-lock assertion.
+snapshot CPU work. The batch size targets roughly one millisecond of usual lock
+time in this fixture, not a hard wall-clock deadline. Scheduling and hardware
+can produce longer holds; 4,096/16,384/32,768-entry medians were about
+0.57/2.29/4.65ms. Linux and macOS regressions pass; the unchanged source fails
+the allocation-outside-lock assertion.

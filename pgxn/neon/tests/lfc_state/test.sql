@@ -1,14 +1,17 @@
 DO $$
-DECLARE result jsonb; scenario text; chunk_log integer;
+DECLARE result jsonb; scenario text; chunk_log integer; batch_size integer; count_chunks integer;
 BEGIN
+  PERFORM snapshot_seed(0, 7);
+  batch_size := (snapshot_capture(1, 'none')::jsonb->>'batch_size')::int;
+  count_chunks := batch_size * 2 + 1;
   -- Every supported chunk width, including bitmaps that end in partial bytes.
   FOR chunk_log IN 0..7 LOOP
-    PERFORM snapshot_seed(1025, chunk_log);
-    result := snapshot_capture(1025, 'none')::jsonb;
-    ASSERT (result->>'chunks')::int = 1025 AND (result->>'unique')::int = 1025;
+    PERFORM snapshot_seed(count_chunks, chunk_log);
+    result := snapshot_capture(count_chunks, 'none')::jsonb;
+    ASSERT (result->>'chunks')::int = count_chunks AND (result->>'unique')::int = count_chunks;
     ASSERT (result->>'ordered')::boolean;
     ASSERT (result->>'allocations_locked')::int = 0;
-    ASSERT (result->>'locks')::int = 10; -- count plus nine bounded batches
+    ASSERT (result->>'locks')::int = 4; -- count plus three bounded batches
     result := snapshot_capture(17, 'none')::jsonb;
     ASSERT (result->>'chunks')::int = 17 AND (result->>'unique')::int = 17;
     ASSERT (result->>'ordered')::boolean;
@@ -21,17 +24,18 @@ BEGIN
   result := snapshot_capture(4096, 'empty')::jsonb;
   ASSERT (result->>'chunks')::int = 0 AND (result->>'pages')::int = 0;
 
+  count_chunks := greatest(4096, batch_size * 4);
   FOREACH scenario IN ARRAY ARRAY['pin', 'evict', 'pin_all', 'touch', 'reset', 'disable'] LOOP
-    PERFORM snapshot_seed(4096, 7);
-    result := snapshot_capture(4096, scenario)::jsonb;
-    ASSERT (result->>'chunks')::int BETWEEN 128 AND 4096;
+    PERFORM snapshot_seed(count_chunks, 7);
+    result := snapshot_capture(count_chunks, scenario)::jsonb;
+    ASSERT (result->>'chunks')::int BETWEEN batch_size AND count_chunks;
     ASSERT (result->>'allocations_locked')::int = 0;
     IF scenario IN ('pin', 'evict') THEN
-      ASSERT (result->>'unique')::int = 4095; -- resume using the next lookahead key
+      ASSERT (result->>'unique')::int = count_chunks - 1; -- resume using the next lookahead key
     ELSIF scenario IN ('pin_all', 'reset', 'disable') THEN
-      ASSERT (result->>'chunks')::int = 128; -- valid partial manifest
+      ASSERT (result->>'chunks')::int = batch_size; -- valid partial manifest
     ELSIF scenario = 'touch' THEN
-      ASSERT (result->>'unique')::int >= 3968; -- a moved key can repeat one batch
+      ASSERT (result->>'unique')::int >= count_chunks - batch_size; -- one batch may repeat
     END IF;
     RAISE NOTICE '%: %', scenario, result;
   END LOOP;

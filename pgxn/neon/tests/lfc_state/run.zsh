@@ -54,9 +54,11 @@ typeset -a sql=("$pg_bin/psql" -XAtq -v ON_ERROR_STOP=1 -h "$scratch/socket" -d 
 CREATE FUNCTION snapshot_seed(integer, integer, boolean DEFAULT true) RETURNS void AS '$scratch/snapshot_test.so', 'snapshot_seed' LANGUAGE C STRICT;
 CREATE FUNCTION snapshot_capture(integer, text) RETURNS text AS '$scratch/snapshot_test.so', 'snapshot_capture' LANGUAGE C STRICT;
 CREATE FUNCTION snapshot_probe(integer) RETURNS text AS '$scratch/snapshot_test.so', 'snapshot_probe' LANGUAGE C STRICT;
+CREATE FUNCTION snapshot_shuffle() RETURNS void AS '$scratch/snapshot_test.so', 'snapshot_shuffle' LANGUAGE C;
 EOF
 if [[ $test_mode == benchmark ]]; then
   "${sql[@]}" -c "SELECT snapshot_seed($fixture_chunks, 7)" > /dev/null
+  [[ ${LFC_SNAPSHOT_SHUFFLE:-false} != true ]] || "${sql[@]}" -c 'SELECT snapshot_shuffle()' > /dev/null
   "${sql[@]}" -c 'SELECT snapshot_probe(15)' > "$scratch/probe.json" &
   typeset probe_pid=$!
   sleep 1
